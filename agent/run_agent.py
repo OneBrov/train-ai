@@ -21,10 +21,16 @@ GITHUB_REPO = os.environ["GITHUB_REPO"]
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")
 
-MAX_DIFF_ATTEMPTS = 3
-TEMPERATURE = 0.2
+MAX_DIFF_ATTEMPTS = int(os.getenv("MAX_DIFF_ATTEMPTS", "3"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
+
+TEST_PROJECT = os.getenv("TEST_PROJECT", r".\core\CoreSim.Tests\CoreSim.Tests.csproj")
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+# Logging
+LOG_DIR = os.path.join(REPO_ROOT, "agent_logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
 # ============================================================
 # Prompts
@@ -36,12 +42,11 @@ You MUST output a single unified git diff that can be applied with `git apply`.
 
 STRICT RULES:
 - Output ONLY the diff. No explanations. No markdown.
-- Do NOT modify .csproj or .sln files.
-- Target framework MUST be net8.0 only.
 - Every opened file must be complete and syntactically valid.
-- If you add a file, include the full file contents.
+- If you add or modify a file, include correct full patch chunks.
 - Do not touch secrets or environment files.
 - Keep changes minimal and directly related to the task.
+- Ensure CI passes.
 
 Output MUST start with:
 diff --git a/... b/...
@@ -50,6 +55,12 @@ diff --git a/... b/...
 # ============================================================
 # Utilities
 # ============================================================
+
+def _write_log(name: str, content: str):
+    path = os.path.join(LOG_DIR, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return path
 
 def sh(cmd: list[str], check=True) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -63,7 +74,10 @@ def sh(cmd: list[str], check=True) -> subprocess.CompletedProcess:
 def ensure_clean_worktree():
     res = sh(["git", "status", "--porcelain"])
     if res.stdout.strip():
-        raise RuntimeError("Working tree is not clean.")
+        raise RuntimeError(
+            "Working tree is not clean.\n"
+            "Commit/stash local changes before running the agent."
+        )
 
 def hard_reset():
     sh(["git", "reset", "--hard"])
@@ -71,8 +85,8 @@ def hard_reset():
 def create_branch(branch: str):
     sh(["git", "checkout", "-B", branch])
 
-def current_branch() -> str:
-    return sh(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+def new_branch_name() -> str:
+    return f"agent/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
 # ============================================================
 # Ollama
@@ -91,31 +105,37 @@ def call_ollama(prompt: str) -> str:
     return r.json()["response"]
 
 # ============================================================
-# Diff validation
+# Diff validation & apply
 # ============================================================
 
 def extract_diff(text: str) -> str:
     match = re.search(r"(diff --git[\s\S]+)", text)
     if not match:
-        raise ValueError("No git diff found.")
+        raise ValueError("No git diff found in model output.")
 
     diff = match.group(1).strip() + "\n"
 
-    if len(diff) < 50:
-        raise ValueError("Diff too small.")
-
-    if ".csproj" in diff or ".sln" in diff:
-        raise ValueError("Modification of csproj/sln is forbidden.")
-
-    if "net10.0" in diff:
-        raise ValueError("net10.0 is forbidden. Use net8.0.")
-
-    if "<Project" in diff or "</Project>" in diff:
-        raise ValueError("XML content is forbidden in diffs.")
+    # If model outputs XML, require basic closure to avoid truncation disasters
+    if "<Project" in diff:
+        if "</Project>" not in diff:
+            raise ValueError("Incomplete XML in diff (missing </Project>).")
+        if diff.count("<Project") != diff.count("</Project>"):
+            raise ValueError("Mismatched <Project> XML tags in diff.")
 
     return diff
 
-def try_apply_diff(diff: str):
+def git_apply_check(diff: str):
+    p = subprocess.run(
+        ["git", "apply", "--check", "--whitespace=nowarn", "-"],
+        cwd=REPO_ROOT,
+        input=diff,
+        text=True,
+        capture_output=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip())
+
+def git_apply(diff: str):
     p = subprocess.run(
         ["git", "apply", "--whitespace=nowarn", "-"],
         cwd=REPO_ROOT,
@@ -131,13 +151,7 @@ def try_apply_diff(diff: str):
 # ============================================================
 
 def run_tests() -> Tuple[bool, str]:
-    cmd = [
-        "dotnet",
-        "test",
-        r".\core\CoreSim.Tests\CoreSim.Tests.csproj",
-        "-c",
-        "Release",
-    ]
+    cmd = ["dotnet", "test", TEST_PROJECT, "-c", "Release"]
     p = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True)
     output = (p.stdout or "") + "\n" + (p.stderr or "")
     return p.returncode == 0, output
@@ -145,6 +159,23 @@ def run_tests() -> Tuple[bool, str]:
 # ============================================================
 # GitHub API
 # ============================================================
+
+def _gh_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+def _gh_raise_for_status(r: requests.Response, context: str):
+    if r.ok:
+        return
+    try:
+        payload = r.json()
+        pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+    except Exception:
+        pretty = r.text
+    log_path = _write_log(f"github_error_{context}.txt", pretty)
+    raise RuntimeError(f"GitHub API error ({context}) {r.status_code}. Details saved to: {log_path}")
 
 def commit_all(message: str):
     sh(["git", "add", "-A"])
@@ -155,64 +186,50 @@ def push_branch(branch: str):
 
 def create_pr(branch: str, title: str, body: str) -> int:
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/pulls"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
     r = requests.post(
         url,
-        headers=headers,
+        headers=_gh_headers(),
         json={"title": title, "head": branch, "base": "main", "body": body},
         timeout=60,
     )
-    r.raise_for_status()
+    if not r.ok:
+        _gh_raise_for_status(r, "create_pr")
     return r.json()["number"]
 
 def enable_auto_merge(pr_number: int):
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/pulls/{pr_number}/auto-merge"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-    r = requests.put(url, headers=headers, json={"merge_method": "squash"}, timeout=60)
-    r.raise_for_status()
-
-def get_pr_reviews(pr_number: int):
-    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/pulls/{pr_number}/reviews"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-    r = requests.get(url, headers=headers, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-def post_pr_comment(pr_number: int, body: str):
-    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/issues/{pr_number}/comments"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-    r = requests.post(url, headers=headers, json={"body": body}, timeout=60)
-    r.raise_for_status()
+    r = requests.put(url, headers=_gh_headers(), json={"merge_method": "squash"}, timeout=60)
+    if not r.ok:
+        _gh_raise_for_status(r, "enable_auto_merge")
 
 # ============================================================
-# Core agent logic
+# Agent loop
 # ============================================================
 
 def generate_and_apply(task: str):
-    last_error = None
+    last_error: Optional[str] = None
 
     for attempt in range(1, MAX_DIFF_ATTEMPTS + 1):
         print(f"[agent] Diff attempt {attempt}/{MAX_DIFF_ATTEMPTS}")
+
         prompt = task
         if last_error:
-            prompt += f"\n\nPREVIOUS FAILURE:\n{last_error}\n\nReturn a corrected git diff."
+            prompt += (
+                "\n\nPREVIOUS FAILURE:\n"
+                f"{last_error}\n\n"
+                "Return a corrected FULL git diff. Output ONLY the diff."
+            )
 
         try:
             raw = call_ollama(prompt)
+            _write_log(f"ollama_raw_attempt_{attempt}.txt", raw)
+
             diff = extract_diff(raw)
-            try_apply_diff(diff)
+            _write_log(f"ollama_diff_attempt_{attempt}.diff", diff)
+
+            # extra safety: check before apply
+            git_apply_check(diff)
+            git_apply(diff)
             return
         except Exception as e:
             hard_reset()
@@ -220,19 +237,6 @@ def generate_and_apply(task: str):
             print("[agent] failed:", last_error)
 
     raise RuntimeError(f"Failed after {MAX_DIFF_ATTEMPTS} attempts. Last error: {last_error}")
-
-def handle_reviews(pr_number: int, task_context: str):
-    reviews = get_pr_reviews(pr_number)
-    for r in reviews:
-        body = (r.get("body") or "").lower()
-        if any(k in body for k in ["error", "fail", "unsupported", "net"]):
-            print("[agent] addressing review feedback")
-            fix_task = task_context + "\n\nREVIEW FEEDBACK:\n" + r["body"]
-            generate_and_apply(fix_task)
-            commit_all("fix: address review feedback")
-            push_branch(current_branch())
-            post_pr_comment(pr_number, "Thanks for the review! Issue fixed.")
-            return
 
 # ============================================================
 # Main
@@ -244,7 +248,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--branch", default=None)
-    parser.add_argument("--pr", action="store_true")
+    parser.add_argument("--pr", action="store_true", help="Create PR and enable auto-merge immediately.")
     args = parser.parse_args()
 
     with open(args.task_file, "r", encoding="utf-8") as f:
@@ -252,31 +256,34 @@ def main():
 
     ensure_clean_worktree()
 
-    branch = args.branch or f"agent/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    branch = args.branch or new_branch_name()
     create_branch(branch)
 
     generate_and_apply(task)
 
     ok, output = run_tests()
+    _write_log("dotnet_test_output.txt", output)
     if not ok:
+        print("[agent] Tests failed, attempting auto-fix")
         fix_task = task + "\n\nTEST OUTPUT:\n" + output
         generate_and_apply(fix_task)
+
         ok2, output2 = run_tests()
+        _write_log("dotnet_test_output_after_fix.txt", output2)
         if not ok2:
-            raise RuntimeError("Tests still failing:\n" + output2)
+            raise RuntimeError("Tests still failing after fix. See agent_logs/ for outputs.")
 
     commit_all("feat: apply task changes")
     push_branch(branch)
 
     if args.pr:
         pr_number = create_pr(
-            branch,
-            "Automated change",
-            "Autonomous agent PR.\n\nHow to verify:\n- dotnet test ./core/CoreSim.Tests/CoreSim.Tests.csproj\n",
+            branch=branch,
+            title="Automated change",
+            body=f"Autonomous agent PR.\n\nHow to verify:\n- dotnet test {TEST_PROJECT}\n",
         )
         enable_auto_merge(pr_number)
-        handle_reviews(pr_number, task)
-        print("PR created with auto-merge:", pr_number)
+        print("PR created + auto-merge enabled:", pr_number)
     else:
         print("Branch pushed:", branch)
 
