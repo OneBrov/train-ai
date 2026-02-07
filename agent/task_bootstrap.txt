@@ -1,0 +1,17 @@
+TASK: Bootstrap a minimal .NET 8 core solution with tests and CI.
+
+Repository context:
+- This repo will host a train game project. For now we only need a core simulation scaffold.
+- Keep it minimal.
+
+Requirements:
+1) Create /core folder with:
+   - CoreSim (class library, net8.0)
+   - CoreSim.Tests (NUnit test project, net8.0)
+2) CoreSim contains a placeholder class.
+3) CoreSim.Tests contains a smoke test.
+4) Add .github/workflows/ci.yml that runs:
+   dotnet test ./core/CoreSim.Tests/CoreSim.Tests.csproj
+5) Add README.md with how to run tests.
+6) Do not touch main branch directly. Work via feature branch.
+Output MUST be a git unified diff starting with "diff --git".
